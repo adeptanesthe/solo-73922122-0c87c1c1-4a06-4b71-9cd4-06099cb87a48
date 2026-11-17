@@ -111,30 +111,43 @@ def article_detail(article_id: int) -> dict:
 
 @app.put("/api/condition")
 def update_condition(body: ConditionIn) -> dict:
-    """修改兴趣和/或配额，开启新世代并触发异步重算。"""
-    current = database.get_state()
-    new_quotas = body.quotas if body.quotas is not None else current["quotas"]
-    _validate_quotas(new_quotas)
-    new_interest = body.interest if body.interest is not None else current["interest"]
-    _validate_interest(new_interest)
+    """修改兴趣和/或配额，开启新世代并触发异步重算。
 
-    # 与已揭示前缀的兼容性前置检查（详细不可行原因由重算任务给出）
+    兼容性校验与写入在同一写事务内（数据库层提供实际已揭示前缀快照），
+    另一个窗口的揭示不会插进“校验旧前缀”和“写入新条件”之间。
+    """
+    # 只校验请求显式提供的字段；未提供的字段由数据库在写事务内按提交时的
+    # 最新状态补全，避免两个窗口并发提交时覆盖对方刚写入的另一字段。
+    # 注意：这里不再读取 state 做兼容性预检——预检与写入之间会有窗口。
+    if body.quotas is not None:
+        _validate_quotas(body.quotas)
+    if body.interest is not None:
+        _validate_interest(body.interest)
+
     from .optimizer import solve_queue  # 局部导入避免循环
     model = get_model()
-    check = solve_queue(
-        relevance=model.relevance_vector(new_interest),
-        quotas=new_quotas,
-        prefix=current["revealed"],
-        excluded_ids=set(current["excluded_ids"]),
-    )
-    if not check.feasible:
-        raise HTTPException(409, f"新条件与已揭示前缀不兼容: {check.reason}")
 
-    database.begin_new_generation(
-        interest=new_interest,
-        quotas=new_quotas,
-        compute_delay_ms=body.compute_delay_ms,
-    )
+    def validate(snapshot: dict) -> str | None:
+        """基于事务内实际已揭示前缀判断新条件是否仍可容纳整个前缀。"""
+        check = solve_queue(
+            relevance=model.relevance_vector(snapshot["interest"]),
+            quotas=snapshot["quotas"],
+            prefix=snapshot["revealed"],
+            excluded_ids=set(snapshot["excluded_ids"]),
+        )
+        if check.feasible:
+            return None
+        return f"新条件与已揭示前缀不兼容: {check.reason}"
+
+    try:
+        database.begin_new_generation(
+            interest=body.interest,
+            quotas=body.quotas,
+            compute_delay_ms=body.compute_delay_ms,
+            validate=validate,
+        )
+    except database.ConditionConflict as exc:
+        raise HTTPException(409, str(exc))
     return _status_payload()
 
 

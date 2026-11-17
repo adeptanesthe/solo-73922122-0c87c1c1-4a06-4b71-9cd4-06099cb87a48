@@ -337,6 +337,221 @@ def test_exclusion_flow_and_revealed_protection(client):
     assert candidates[0] not in r3["state"]["excluded_ids"]
 
 
+def test_condition_update_and_reveal_are_serialized(client, monkeypatch):
+    """交错顺序 A：条件更新先取得写锁，揭示必须等它完成并使用新世代。
+
+    旧实现只在事务外读一次前缀再写入：PUT 校验（旧前缀为空）期间另一窗口的
+    揭示可以落地 2 篇，随后 PUT 仍写入与这 2 篇冲突的配额，计划变为不可行。
+    修复后两者共用同一把写锁，揭示被阻塞；PUT 成功后揭示只能看到新世代，
+    旧计划不会推进，且新计划可容纳全部已揭示文章。
+    """
+    import app.optimizer as optimizer
+
+    c, database, _ = client
+    data = _wait_done(c)
+    assert data["state"]["revealed"] == []
+
+    # 这个配额在“空前缀”下可行，但若先揭示某主题就会冲突
+    revealed_topic = data["plan"]["queue"][0]["topic"]
+    topics = data["topics"]
+    bad_quotas = {t: 1 for t in topics}
+    bad_quotas[revealed_topic] = 0
+    other = next(t for t in topics if t != revealed_topic)
+    bad_quotas[other] = 2
+
+    original_solve = optimizer.solve_queue
+    check_started = threading.Event()
+    allow_check = threading.Event()
+
+    def delayed_solve(*args, **kwargs):
+        if not check_started.is_set():
+            check_started.set()
+            assert allow_check.wait(10), "等待揭示超时"
+        return original_solve(*args, **kwargs)
+
+    monkeypatch.setattr(optimizer, "solve_queue", delayed_solve)
+    put_result: dict = {}
+    reveal_result: dict = {}
+
+    def do_put():
+        put_result["resp"] = c.put("/api/condition", json={"quotas": bad_quotas})
+
+    def do_reveal():
+        reveal_result["resp"] = c.post("/api/reveal")
+
+    put_thread = threading.Thread(target=do_put)
+    put_thread.start()
+    assert check_started.wait(5), "PUT 未进入兼容性校验"
+
+    # PUT 持有写锁期间，另一窗口的揭示请求必须排队而不能先推进
+    reveal_thread = threading.Thread(target=do_reveal)
+    reveal_thread.start()
+    import time
+
+    time.sleep(0.3)
+    assert "resp" not in reveal_result, "揭示不应在条件更新提交前完成"
+    allow_check.set()
+    put_thread.join(10)
+    reveal_thread.join(10)
+
+    assert put_result["resp"].status_code == 200
+    # 揭示请求拿到锁时只能看到新世代：要么任务尚未算完（409），
+    # 要么已按新计划推进；绝不能用旧计划揭示。
+    after = c.get("/api/status").json()
+    assert after["state"]["generation"] == 2
+    assert after["state"]["quotas"] == bad_quotas
+    reveal_resp = reveal_result["resp"]
+    assert reveal_resp.status_code in (200, 409)
+    if reveal_resp.status_code == 409:
+        assert after["state"]["revealed"] == []
+    else:
+        new_plan_ids = [
+            q["article_id"] for q in after["plan"]["queue"][:2]
+        ] if after["plan"] else []
+        assert [x["article_id"] for x in after["state"]["revealed"]] == new_plan_ids
+
+    # 新世代结果必须可容纳全部已揭示文章，随后揭示按新计划进行
+    final = _wait_done(c)
+    assert final["plan"]["feasible"] is True
+    prefix_ids = [x["article_id"] for x in final["state"]["revealed"]]
+    assert [q["article_id"] for q in final["plan"]["queue"][: len(prefix_ids)]] == prefix_ids
+    if len(prefix_ids) < 6:
+        revealed = c.post("/api/reveal").json()
+        assert revealed["reveal_outcome"]["advanced"] is True
+        assert [x["article_id"] for x in revealed["state"]["revealed"]] == [
+            q["article_id"] for q in final["plan"]["queue"][: len(prefix_ids) + 2]
+        ]
+
+
+def test_condition_update_sees_prefix_revealed_while_request_in_flight(client, monkeypatch):
+    """交错顺序 B：揭示先完成，迟到提交的 PUT 必须按新前缀拒绝并保留原状态。"""
+    import app.main as main_mod
+
+    c, database, _ = client
+    _wait_done(c)
+    status = c.get("/api/status").json()
+    revealed_topic = status["plan"]["queue"][0]["topic"]
+    topics = status["topics"]
+    bad_quotas = {t: 1 for t in topics}
+    bad_quotas[revealed_topic] = 0
+    other = next(t for t in topics if t != revealed_topic)
+    bad_quotas[other] = 2
+
+    gen_before = status["state"]["generation"]
+    job_before = status["job"]
+    prefix_before = status["state"]["revealed"]
+
+    original_get_model = main_mod.get_model
+    put_prepared = threading.Event()
+    allow_put = threading.Event()
+
+    def delayed_get_model():
+        if not put_prepared.is_set():
+            put_prepared.set()
+            assert allow_put.wait(10), "等待揭示超时"
+        return original_get_model()
+
+    monkeypatch.setattr(main_mod, "get_model", delayed_get_model)
+    result: dict = {}
+
+    def do_put():
+        result["resp"] = c.put("/api/condition", json={"quotas": bad_quotas})
+
+    put_thread = threading.Thread(target=do_put)
+    put_thread.start()
+    assert put_prepared.wait(5), "PUT 未准备完成"
+
+    # PUT 尚未提交写事务；另一窗口先揭示两篇
+    reveal = c.post("/api/reveal").json()
+    assert reveal["reveal_outcome"]["advanced"] is True
+    revealed_ids = [x["article_id"] for x in reveal["state"]["revealed"]]
+    assert len(revealed_ids) == 2
+    allow_put.set()
+    put_thread.join(10)
+
+    assert result["resp"].status_code == 409
+    assert "已揭示前缀" in result["resp"].json()["detail"]
+
+    after = c.get("/api/status").json()
+    # 原条件、世代、已揭示前缀、当前重算任务全部保留
+    assert after["state"]["generation"] == gen_before
+    assert after["state"]["quotas"] == status["state"]["quotas"]
+    assert after["state"]["interest"] == status["state"]["interest"]
+    assert [x["article_id"] for x in after["state"]["revealed"]] == revealed_ids
+    assert after["job"]["generation"] == job_before["generation"]
+    assert after["job"]["status"] == job_before["status"]
+    # 原条件仍可行为新前缀出完整队列
+    assert after["plan"]["feasible"] is True
+    assert [q["article_id"] for q in after["plan"]["queue"][:2]] == revealed_ids
+    assert prefix_before == []
+
+
+def test_late_result_from_old_prefix_is_rejected_at_writeback(client):
+    """旧前缀下算出的结果迟到写回时被拒，不会覆盖当前任务。"""
+    import json
+
+    c, database, _ = client
+    _wait_done(c)
+    before = c.get("/api/status").json()
+    plan = before["plan"]
+
+    # 停掉 worker，手工开启并领取一个任务，模拟“计算已开始”
+    main = __import__("app.main", fromlist=["get_worker"])
+    main.get_worker().stop()
+    database.begin_new_generation(interest=None, quotas=None, compute_delay_ms=0)
+    job = database.claim_pending_job()
+    generation = job["generation"]
+
+    # 计算期间发生了一次揭示（当前前缀变为 1 篇），但结果仍按空前缀生成
+    revealed = [{
+        "article_id": 999, "topic": "人工智能", "author": "x",
+        "relevance": 0.0, "position": 1,
+    }]
+    with database._write_tx() as conn:
+        conn.execute(
+            "UPDATE state SET revealed_json = ? WHERE id = 1",
+            (json.dumps(revealed, ensure_ascii=False),),
+        )
+
+    stale_result = {"feasible": True, "queue": plan["queue"], "score": 0.0, "reason": None}
+    assert database.complete_job(
+        generation, stale_result, prefix_ids=[]
+    ) is False
+    assert database.get_job(generation)["status"] == "stale"
+    assert database.get_job(generation)["result"] is None
+
+    # 恢复：清掉手工置入的前缀，让后续用例不受影响
+    with database._write_tx() as conn:
+        conn.execute(
+            "UPDATE state SET revealed_json = '[]' WHERE id = 1"
+        )
+
+
+def test_condition_update_rejects_incompatible_newly_revealed_prefix(client):
+    """无并发时也要按实际（已揭示）前缀拒绝，而非旧前缀。"""
+    c, database, _ = client
+    _wait_done(c)
+    first = c.post("/api/reveal").json()
+    revealed_topic = first["state"]["revealed"][0]["topic"]
+    revealed_ids = [x["article_id"] for x in first["state"]["revealed"]]
+    gen_before = first["state"]["generation"]
+
+    status = c.get("/api/status").json()
+    bad_quotas = {t: 1 for t in status["topics"]}
+    bad_quotas[revealed_topic] = 0
+    other = next(t for t in status["topics"] if t != revealed_topic)
+    bad_quotas[other] = 2
+    r = c.put("/api/condition", json={"quotas": bad_quotas})
+    assert r.status_code == 409
+
+    after = c.get("/api/status").json()
+    assert after["state"]["generation"] == gen_before
+    assert after["state"]["quotas"] == first["state"]["quotas"]
+    assert [x["article_id"] for x in after["state"]["revealed"]] == revealed_ids
+    assert after["job"]["generation"] == gen_before
+    assert after["plan"]["feasible"] is True
+
+
 def test_infeasible_condition_stops_reveal_but_keeps_prefix(client):
     c, database, _ = client
     _wait_done(c)

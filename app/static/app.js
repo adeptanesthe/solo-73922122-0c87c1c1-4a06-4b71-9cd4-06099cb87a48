@@ -2,7 +2,13 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
-const state = { data: null, pollTimer: null };
+const state = { data: null, pollTimer: null, quotasDirty: false, interestDirty: false };
+
+function sameQuotas(a, b) {
+  const keys = Object.keys(b || {});
+  return keys.length === Object.keys(a || {}).length &&
+    keys.every((t) => (parseInt(a[t], 10) || 0) === (parseInt(b[t], 10) || 0));
+}
 
 async function api(path, options = {}) {
   const resp = await fetch(path, {
@@ -36,7 +42,10 @@ function renderQuotas() {
     input.max = 6;
     input.value = quotas[topic];
     input.dataset.topic = topic;
-    input.addEventListener("input", renderQuotaSum);
+    input.addEventListener("input", () => {
+      state.quotasDirty = true;
+      renderQuotaSum();
+    });
     wrap.appendChild(input);
     grid.appendChild(wrap);
   });
@@ -207,8 +216,24 @@ function showMsg(el, text, ok = false) {
 
 async function refresh() {
   state.data = await api("/api/status");
-  $("#interest").value = state.data.state.interest;
-  renderQuotas();
+  // 轮询期间不覆盖正在编辑的兴趣/配额：两个窗口各自持有草稿时，
+  // 另一窗口的变更不应把本窗口未提交的输入冲掉。输入框失去焦点后，
+  // 若内容仍与服务端一致则清除“草稿”标记，后续轮询恢复同步。
+  const interestEl = $("#interest");
+  const serverInterest = state.data.state.interest;
+  if (document.activeElement !== interestEl) {
+    if (!state.interestDirty || interestEl.value === serverInterest) {
+      interestEl.value = serverInterest;
+      state.interestDirty = false;
+    }
+  }
+  if (!state.quotasDirty && !document.querySelector("#quota-grid input:focus")) {
+    renderQuotas();
+  } else if (!document.querySelector("#quota-grid input:focus") &&
+             sameQuotas(readQuotas(), state.data.state.quotas)) {
+    state.quotasDirty = false;
+    renderQuotas();
+  }
   renderQueue();
   schedulePoll();
 }
@@ -231,12 +256,21 @@ async function applyCondition() {
     };
     $("#btn-apply").disabled = true;
     state.data = await api("/api/condition", { method: "PUT", body: JSON.stringify(payload) });
+    state.quotasDirty = false;
+    state.interestDirty = false;
     renderQuotas();
     renderQueue();
     showMsg(msg, "条件已更新，新世代重算已开始", true);
     schedulePoll();
   } catch (err) {
+    // 409 表示提交时另一窗口已揭示、新条件容不下实际前缀。
+    // 保留用户正在编辑的兴趣/配额，只刷新队列与状态，便于对照后重试。
     showMsg(msg, err.message);
+    try {
+      state.data = await api("/api/status");
+      renderQueue();
+      schedulePoll();
+    } catch (_) { /* 刷新失败时保留当前视图 */ }
   } finally {
     $("#btn-apply").disabled = false;
   }
@@ -300,6 +334,7 @@ async function resetDemo() {
 }
 
 $("#btn-apply").addEventListener("click", applyCondition);
+$("#interest").addEventListener("input", () => { state.interestDirty = true; });
 $("#btn-reveal").addEventListener("click", revealNext);
 $("#btn-exclude").addEventListener("click", addExclusion);
 $("#btn-reset").addEventListener("click", resetDemo);

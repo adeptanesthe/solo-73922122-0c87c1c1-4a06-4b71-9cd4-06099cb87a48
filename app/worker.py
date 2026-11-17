@@ -85,10 +85,12 @@ class ComputeWorker:
 
             model = get_model()
             relevance = model.relevance_vector(snapshot["interest"])
+            prefix = state["revealed"]
+            prefix_ids = [item["article_id"] for item in prefix]
             result = solve_queue(
                 relevance=relevance,
                 quotas=snapshot["quotas"],
-                prefix=state["revealed"],
+                prefix=prefix,
                 excluded_ids=set(snapshot.get("excluded_ids", state["excluded_ids"])),
             )
             payload = {
@@ -97,7 +99,9 @@ class ComputeWorker:
                 "score": result.score,
                 "reason": result.reason,
             }
-            accepted = database.complete_job(generation, payload)
+            accepted = database.complete_job(
+                generation, payload, prefix_ids=prefix_ids
+            )
             if not accepted:
                 log.info("世代 %s 的迟到结果已被丢弃", generation)
         except Exception as exc:  # 失败不推进进度，只记录任务错误

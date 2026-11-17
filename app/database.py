@@ -7,7 +7,9 @@
 * WAL 模式 + BEGIN IMMEDIATE 写事务，配合进程内写锁串行化所有变更，
   保证并发请求下“同条件同进度只推进一次”；
 * 已揭示前缀、条件、世代号(generation)全部落盘，重启后完整恢复；
-* 后台任务只在“仍是最新世代且条件未变”时才允许写回结果，迟到结果被丢弃。
+* 条件变更的兼容性校验与写入在同一写事务内，基于实际已揭示前缀判断；
+* 后台任务只在“仍是最新世代、且计算时的已揭示前缀未变”时才允许写回结果，
+  迟到结果被丢弃。
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from .articles_data import ARTICLES, TOPICS
 
@@ -31,6 +33,12 @@ _CLAIM_TTL_SECONDS = float(os.environ.get("REVEAL_CLAIM_TTL", "2"))
 # 进程内写锁：SQLite 文件锁跨进程有效，但进程内多线程的极短事务在 GIL
 # 交错下可能连续提交；可重入锁把所有写事务在进程内串行化，双保险。
 _write_lock = threading.RLock()
+
+
+class ConditionConflict(Exception):
+    """新条件与提交时的实际已揭示前缀不兼容；调用方不得修改任何状态。"""
+
+
 # 揭示并发批次状态：_reveal_generation 记录最近一次揭示所属世代，
 # _reveal_batch_deadline 是该批次的宽限截止时间；同一并发批次内，
 # 在写锁上排队的后续请求直接复用首个请求的结果而不再推进。
@@ -256,14 +264,40 @@ def begin_new_generation(
     interest: str | None,
     quotas: dict[str, int] | None,
     compute_delay_ms: int,
+    validate: Callable[[dict[str, Any]], str | None] | None = None,
 ) -> dict[str, Any]:
-    """修改兴趣/配额，世代号 +1，并登记一条 pending 任务。"""
+    """修改兴趣/配额，世代号 +1，并登记一条 pending 任务。
+
+    兼容性校验必须在写事务内、基于**实际已揭示前缀快照**完成：
+    调用方传入的 ``validate`` 接收包含 ``interest``/``quotas``/``revealed``/
+    ``excluded_ids`` 的快照，返回不可行原因（字符串）或 None。这样“检查前缀”
+    与“写入新条件”由同一个 BEGIN IMMEDIATE + 进程内写锁保护，中间不会插入
+    揭示请求，避免按旧前缀放行、随后与刚揭示的文章冲突。
+
+    校验失败时不修改任何状态（条件、世代、已揭示前缀、当前重算任务全部保留），
+    并抛出 ``ConditionConflict`` 供 API 层转成 409。
+    """
     with _write_tx() as conn:
         row = conn.execute("SELECT * FROM state WHERE id = 1").fetchone()
         cur_interest = row["interest"]
         cur_quotas = json.loads(row["quotas_json"])
+        revealed = json.loads(row["revealed_json"])
+        excluded_ids = _excluded_ids_locked(conn)
         new_interest = interest if interest is not None else cur_interest
         new_quotas = quotas if quotas is not None else cur_quotas
+
+        if validate is not None:
+            reason = validate(
+                {
+                    "interest": new_interest,
+                    "quotas": new_quotas,
+                    "revealed": revealed,
+                    "excluded_ids": excluded_ids,
+                }
+            )
+            if reason:
+                raise ConditionConflict(reason)
+
         new_gen = row["generation"] + 1
         conn.execute(
             "UPDATE state SET interest = ?, quotas_json = ?, generation = ?, "
@@ -279,6 +313,7 @@ def begin_new_generation(
         snapshot = {
             "interest": new_interest,
             "quotas": new_quotas,
+            "excluded_ids": excluded_ids,
             "compute_delay_ms": compute_delay_ms,
         }
         conn.execute(
@@ -290,6 +325,32 @@ def begin_new_generation(
 
 
 # ---------------- 排除集变更（同样开启新世代） ----------------
+
+
+def _begin_exclusion_generation(
+    conn: sqlite3.Connection,
+    state_row: sqlite3.Row,
+    compute_delay_ms: int,
+) -> None:
+    """在既有写事务内：世代 +1、作废旧任务、登记带排除集的 pending 任务。"""
+    new_gen = state_row["generation"] + 1
+    quotas = json.loads(state_row["quotas_json"])
+    conn.execute(
+        "UPDATE state SET generation = ?, updated_at = ? WHERE id = 1",
+        (new_gen, _now()),
+    )
+    _stale_running_jobs(conn)
+    snapshot = {
+        "interest": state_row["interest"],
+        "quotas": quotas,
+        "excluded_ids": _excluded_ids_locked(conn),
+        "compute_delay_ms": compute_delay_ms,
+    }
+    conn.execute(
+        "INSERT INTO jobs(generation, status, condition_snapshot_json, "
+        "created_at) VALUES (?, 'pending', ?, ?)",
+        (new_gen, json.dumps(snapshot, ensure_ascii=False), _now()),
+    )
 
 
 def add_exclusion(article_id: int, compute_delay_ms: int) -> dict[str, Any]:
@@ -306,24 +367,7 @@ def add_exclusion(article_id: int, compute_delay_ms: int) -> dict[str, Any]:
         conn.execute(
             "INSERT INTO exclusions(article_id) VALUES (?)", (article_id,)
         )
-        new_gen = state_row["generation"] + 1
-        quotas = json.loads(state_row["quotas_json"])
-        conn.execute(
-            "UPDATE state SET generation = ?, updated_at = ? WHERE id = 1",
-            (new_gen, _now()),
-        )
-        _stale_running_jobs(conn)
-        snapshot = {
-            "interest": state_row["interest"],
-            "quotas": quotas,
-            "excluded_ids": _excluded_ids_locked(conn),
-            "compute_delay_ms": compute_delay_ms,
-        }
-        conn.execute(
-            "INSERT INTO jobs(generation, status, condition_snapshot_json, "
-            "created_at) VALUES (?, 'pending', ?, ?)",
-            (new_gen, json.dumps(snapshot, ensure_ascii=False), _now()),
-        )
+        _begin_exclusion_generation(conn, state_row, compute_delay_ms)
     return get_state()
 
 
@@ -336,24 +380,7 @@ def remove_exclusion(article_id: int, compute_delay_ms: int) -> dict[str, Any]:
             raise ValueError("该文章不在排除列表中")
         conn.execute("DELETE FROM exclusions WHERE article_id = ?", (article_id,))
         state_row = conn.execute("SELECT * FROM state WHERE id = 1").fetchone()
-        new_gen = state_row["generation"] + 1
-        quotas = json.loads(state_row["quotas_json"])
-        conn.execute(
-            "UPDATE state SET generation = ?, updated_at = ? WHERE id = 1",
-            (new_gen, _now()),
-        )
-        _stale_running_jobs(conn)
-        snapshot = {
-            "interest": state_row["interest"],
-            "quotas": quotas,
-            "excluded_ids": _excluded_ids_locked(conn),
-            "compute_delay_ms": compute_delay_ms,
-        }
-        conn.execute(
-            "INSERT INTO jobs(generation, status, condition_snapshot_json, "
-            "created_at) VALUES (?, 'pending', ?, ?)",
-            (new_gen, json.dumps(snapshot, ensure_ascii=False), _now()),
-        )
+        _begin_exclusion_generation(conn, state_row, compute_delay_ms)
     return get_state()
 
 
@@ -377,17 +404,37 @@ def claim_pending_job() -> dict[str, Any] | None:
     return get_job(generation)
 
 
-def complete_job(generation: int, result: dict[str, Any]) -> bool:
-    """写回成功结果。若世代已过期则拒绝，返回 False。"""
+def complete_job(
+    generation: int,
+    result: dict[str, Any],
+    prefix_ids: list[int] | None = None,
+) -> bool:
+    """写回成功结果。若世代已过期或已揭示前缀已变化则拒绝，返回 False。
+
+    ``prefix_ids`` 是 worker 实际计算时使用的已揭示文章序列。除世代号外再核对
+    一次前缀：即使未来引入多 worker 或其它写入路径，旧前缀下算出的队列也绝不
+    会落库生效。
+    """
     with _write_tx() as conn:
         row = conn.execute(
             "SELECT * FROM jobs WHERE generation = ?", (generation,)
         ).fetchone()
-        current_gen = conn.execute(
-            "SELECT generation FROM state WHERE id = 1"
-        ).fetchone()[0]
-        if not row or row["status"] != "running" or current_gen != generation:
-            # 迟到结果：旧条件推荐不得落库揭示
+        state_row = conn.execute("SELECT * FROM state WHERE id = 1").fetchone()
+        current_gen = state_row["generation"]
+        current_prefix = [
+            item["article_id"] for item in json.loads(state_row["revealed_json"])
+        ]
+        queue_ids = [item["article_id"] for item in result.get("queue") or []]
+        prefix_mismatch = prefix_ids is not None and list(prefix_ids) != current_prefix
+        if result.get("feasible") and queue_ids[: len(current_prefix)] != current_prefix:
+            prefix_mismatch = True
+        if not row:
+            return False
+        if row["status"] != "running":
+            # 已经 done/stale/failed 的任务不再改写，避免覆盖有效结果
+            return False
+        if current_gen != generation or prefix_mismatch:
+            # 迟到结果：旧条件/旧前缀的推荐不得落库揭示
             conn.execute(
                 "UPDATE jobs SET status = 'stale', finished_at = ? "
                 "WHERE generation = ? AND status = 'running'",
@@ -458,6 +505,13 @@ def reveal_next_two() -> dict[str, Any]:
     （两个浏览器窗口同时点击、客户端重试、在锁上排队的姊妹线程）直接复用
     首个请求的结果而不再推进。窗口过后顺序发起的“揭示下一组”开启新批次、
     正常推进，因此 6 篇队列可分三轮揭示完毕。
+
+    与条件更新的交错
+    ----------------
+    揭示在同一 ``_write_lock`` + ``BEGIN IMMEDIATE`` 事务内读取“当前世代、
+    当前已揭示前缀、该世代已完成的结果”。条件更新同样在这把锁内基于同一份
+    实际前缀做兼容性校验，两者不会交错。因此每次揭示时结果都与前缀一致；
+    ``result`` 必须覆盖“前缀已揭示文章”的完整序列（从头开始），否则拒绝推进。
     """
     with _write_lock:
         with _write_tx() as conn:
@@ -500,6 +554,10 @@ def reveal_next_two() -> dict[str, Any]:
                 return outcome
 
             queue = result["queue"]
+            revealed_ids = [item["article_id"] for item in revealed]
+            if [item["article_id"] for item in queue[:current_len]] != revealed_ids:
+                # 防御：结果必须完整容纳已揭示前缀，否则拒绝据此推进
+                raise RuntimeError("当前推荐与已揭示前缀不一致，请重新计算")
             if current_len >= len(queue):
                 outcome = {
                     "advanced": False,
